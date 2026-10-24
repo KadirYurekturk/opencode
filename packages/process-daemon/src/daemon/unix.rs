@@ -136,7 +136,7 @@ pub(super) fn process_exists(pid: u32) -> bool {
 
 /// Removes the socket of an abandoned runtime found by the shared sweep.
 pub(super) fn remove_stale_endpoint(canonical_directory: &Path) -> Result<()> {
-    let socket = socket_file(&socket_root(), canonical_directory);
+    let socket = socket_file(&socket_root()?, canonical_directory);
     if fs::symlink_metadata(&socket).is_ok_and(|metadata| metadata.file_type().is_socket()) {
         fs::remove_file(&socket)?;
     }
@@ -146,17 +146,28 @@ pub(super) fn remove_stale_endpoint(canonical_directory: &Path) -> Result<()> {
 fn socket_path(directory: &Path) -> Result<PathBuf> {
     let directory =
         fs::canonicalize(directory).context("failed to resolve PTY runtime directory")?;
-    let root = socket_root();
+    let root = socket_root()?;
     ensure_private_directory(&root)?;
     Ok(socket_file(&root, &directory))
 }
 
-// Sockets stay in /tmp so their paths fit sun_path; temp cleaners skip sockets.
-fn socket_root() -> PathBuf {
-    PathBuf::from("/tmp").join(format!(
-        "opencode-pty-{}",
-        nix::unistd::Uid::effective().as_raw()
-    ))
+// The default path stays short enough for sun_path; temp cleaners skip sockets.
+fn socket_root() -> Result<PathBuf> {
+    resolve_socket_root(
+        std::env::var_os("OPENCODE_PTY_SOCKET_DIR").map(PathBuf::from),
+        nix::unistd::Uid::effective().as_raw(),
+    )
+}
+
+fn resolve_socket_root(directory: Option<PathBuf>, uid: u32) -> Result<PathBuf> {
+    match directory {
+        Some(directory) if !directory.is_absolute() => {
+            Err(anyhow!("OPENCODE_PTY_SOCKET_DIR must be an absolute path"))
+        }
+        // Strip trailing separators and "." so metadata checks the final component.
+        Some(directory) => Ok(directory.components().collect()),
+        None => Ok(PathBuf::from("/tmp").join(format!("opencode-pty-{uid}"))),
+    }
 }
 
 fn socket_file(root: &Path, canonical_directory: &Path) -> PathBuf {
@@ -221,6 +232,44 @@ mod tests {
     use std::os::unix::net::UnixListener;
 
     use super::*;
+
+    #[test]
+    fn socket_root_preserves_default_uid_directory() {
+        assert_eq!(
+            resolve_socket_root(None, 12345).unwrap(),
+            PathBuf::from("/tmp/opencode-pty-12345")
+        );
+    }
+
+    #[test]
+    fn socket_root_accepts_explicit_absolute_directory() {
+        let root = PathBuf::from("/private/tmp/task-owned-pty");
+        assert_eq!(
+            resolve_socket_root(Some(root.clone()), 12345).unwrap(),
+            root
+        );
+    }
+
+    #[test]
+    fn socket_root_rejects_empty_and_relative_overrides() {
+        for root in ["", ".", "..", "relative", "../socket"] {
+            assert!(resolve_socket_root(Some(PathBuf::from(root)), 12345).is_err());
+        }
+    }
+
+    #[test]
+    fn socket_root_override_retains_symlink_rejection() {
+        let base = std::env::temp_dir().join(format!("opencode-pty-root-test-{}", random_id()));
+        fs::create_dir_all(base.join("target")).unwrap();
+        let root = base.join("socket-link");
+        std::os::unix::fs::symlink(base.join("target"), &root).unwrap();
+        for suffix in ["", "/", "/."] {
+            let root = PathBuf::from(format!("{}{suffix}", root.display()));
+            let root = resolve_socket_root(Some(root), 12345).unwrap();
+            assert!(ensure_private_directory(&root).is_err());
+        }
+        fs::remove_dir_all(base).unwrap();
+    }
 
     #[test]
     fn socket_paths_are_short_and_runtime_specific() {
