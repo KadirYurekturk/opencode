@@ -2,10 +2,10 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::thread::{self, JoinHandle};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use fs2::FileExt;
 use sha2::{Digest, Sha256};
 
@@ -135,9 +135,20 @@ pub(super) fn process_exists(pid: u32) -> bool {
 }
 
 /// Removes the socket of an abandoned runtime found by the shared sweep.
-pub(super) fn remove_stale_endpoint(canonical_directory: &Path) -> Result<()> {
-    let socket = socket_file(&socket_root()?, canonical_directory);
-    if fs::symlink_metadata(&socket).is_ok_and(|metadata| metadata.file_type().is_socket()) {
+pub(super) fn remove_stale_endpoint(
+    canonical_directory: &Path,
+    registration: Option<&Registration>,
+) -> Result<()> {
+    // The abandoned daemon may have used a different OPENCODE_PTY_SOCKET_DIR, so
+    // prefer the socket it registered over this daemon's socket root.
+    let socket = match registration {
+        Some(registration) => registration.socket.clone(),
+        None => socket_file(&socket_root()?, canonical_directory),
+    };
+    let uid = nix::unistd::Uid::effective().as_raw();
+    if fs::symlink_metadata(&socket)
+        .is_ok_and(|metadata| metadata.file_type().is_socket() && metadata.uid() == uid)
+    {
         fs::remove_file(&socket)?;
     }
     Ok(())
@@ -160,14 +171,23 @@ fn socket_root() -> Result<PathBuf> {
 }
 
 fn resolve_socket_root(directory: Option<PathBuf>, uid: u32) -> Result<PathBuf> {
-    match directory {
+    let base = match directory {
+        None => PathBuf::from("/tmp"),
         Some(directory) if !directory.is_absolute() => {
-            Err(anyhow!("OPENCODE_PTY_SOCKET_DIR must be an absolute path"))
+            bail!("OPENCODE_PTY_SOCKET_DIR must be an absolute path")
         }
-        // Strip trailing separators and "." so metadata checks the final component.
-        Some(directory) => Ok(directory.components().collect()),
-        None => Ok(PathBuf::from("/tmp").join(format!("opencode-pty-{uid}"))),
-    }
+        Some(directory)
+            if directory
+                .components()
+                .any(|part| part == Component::ParentDir) =>
+        {
+            bail!("OPENCODE_PTY_SOCKET_DIR must not contain '..'")
+        }
+        Some(directory) => directory,
+    };
+    // Sockets live in a dedicated child so the 0700 permission change never
+    // applies to a caller-chosen directory.
+    Ok(base.join(format!("opencode-pty-{uid}")))
 }
 
 fn socket_file(root: &Path, canonical_directory: &Path) -> PathBuf {
@@ -242,32 +262,50 @@ mod tests {
     }
 
     #[test]
-    fn socket_root_accepts_explicit_absolute_directory() {
-        let root = PathBuf::from("/private/tmp/task-owned-pty");
+    fn socket_root_uses_dedicated_child_of_explicit_directory() {
         assert_eq!(
-            resolve_socket_root(Some(root.clone()), 12345).unwrap(),
-            root
+            resolve_socket_root(Some(PathBuf::from("/private/tmp/task-owned-pty")), 12345).unwrap(),
+            PathBuf::from("/private/tmp/task-owned-pty/opencode-pty-12345")
         );
     }
 
     #[test]
-    fn socket_root_rejects_empty_and_relative_overrides() {
-        for root in ["", ".", "..", "relative", "../socket"] {
+    fn socket_root_rejects_relative_and_parent_overrides() {
+        for root in [
+            "",
+            ".",
+            "..",
+            "relative",
+            "../socket",
+            "/tmp/..",
+            "/tmp/a/../b",
+        ] {
             assert!(resolve_socket_root(Some(PathBuf::from(root)), 12345).is_err());
         }
     }
 
     #[test]
-    fn socket_root_override_retains_symlink_rejection() {
+    fn socket_root_leaves_explicit_directory_permissions_alone() {
+        let base = std::env::temp_dir().join(format!("opencode-pty-root-test-{}", random_id()));
+        fs::create_dir_all(&base).unwrap();
+        fs::set_permissions(&base, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let root = resolve_socket_root(Some(base.clone()), 12345).unwrap();
+        ensure_private_directory(&root).unwrap();
+
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&base), 0o755);
+        assert_eq!(mode(&root), 0o700);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn socket_root_rejects_symlinked_child() {
         let base = std::env::temp_dir().join(format!("opencode-pty-root-test-{}", random_id()));
         fs::create_dir_all(base.join("target")).unwrap();
-        let root = base.join("socket-link");
+        let root = resolve_socket_root(Some(base.clone()), 12345).unwrap();
         std::os::unix::fs::symlink(base.join("target"), &root).unwrap();
-        for suffix in ["", "/", "/."] {
-            let root = PathBuf::from(format!("{}{suffix}", root.display()));
-            let root = resolve_socket_root(Some(root), 12345).unwrap();
-            assert!(ensure_private_directory(&root).is_err());
-        }
+        assert!(ensure_private_directory(&root).is_err());
         fs::remove_dir_all(base).unwrap();
     }
 
@@ -297,6 +335,37 @@ mod tests {
         fs::write(abandoned.join(LOCK_FILE), b"").unwrap();
         let socket = socket_path(&abandoned).unwrap();
         drop(UnixListener::bind(&socket).unwrap());
+
+        let later = std::time::SystemTime::now()
+            + super::super::sweep::STALE_RUNTIME_AGE
+            + std::time::Duration::from_secs(1);
+        super::super::sweep::runtime(&abandoned, later).unwrap();
+
+        assert!(!abandoned.exists());
+        assert!(!socket.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sweep_removes_socket_recorded_in_registration() {
+        let root = std::env::temp_dir().join(format!("opencode-pty-sweep-test-{}", random_id()));
+        let abandoned = root.join(random_id());
+        fs::create_dir_all(&abandoned).unwrap();
+        fs::write(abandoned.join(LOCK_FILE), b"").unwrap();
+        // macOS temp directories are too long for sun_path.
+        let socket = PathBuf::from(format!(
+            "/tmp/opencode-pty-test-{}.sock",
+            &random_id()[..16]
+        ));
+        drop(UnixListener::bind(&socket).unwrap());
+        let registration = Registration {
+            instance_id: random_id(),
+            pid: std::process::id(),
+            protocol: PROTOCOL_VERSION,
+            socket: socket.clone(),
+            token: random_id(),
+        };
+        write_registration(&abandoned, &registration).unwrap();
 
         let later = std::time::SystemTime::now()
             + super::super::sweep::STALE_RUNTIME_AGE
