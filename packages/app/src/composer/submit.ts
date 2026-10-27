@@ -28,7 +28,6 @@ type ComposerSubmission = {
   images: ImageAttachmentPart[]
   selection: ComposerSelection
   delivery: ComposerDelivery
-  genui: boolean
 }
 
 type ComposerSubmitInput = {
@@ -43,8 +42,6 @@ type ComposerSubmitInput = {
   setMode: (mode: "normal" | "shell") => void
   closePopover: () => void
   delivery?: (alternate: boolean) => ComposerDelivery
-  /** Whether the app shows generated UI; tells the server it may offer the agent genui_render. Defaults to false. */
-  genui?: Accessor<boolean>
   clientCommand?: (text: string) => (() => void | Promise<void>) | undefined
   notify: {
     missingSelection: () => void
@@ -359,7 +356,6 @@ function readSubmission(
     images,
     selection,
     delivery: input.delivery?.(alternate) ?? "steer",
-    genui: input.genui?.() === true,
   }
 }
 
@@ -456,6 +452,7 @@ function restoreSubmission(
       }
     }),
   )
+  submission.sources.forEach((item) => restored.target.quoteSource.add(item.key, item.source))
   restored.context.forEach((item) => {
     if (item.type === "file" && !item.comment?.trim())
       restored.target.context.add({
@@ -621,7 +618,6 @@ async function sendPrompt(
       attachments: request.attachments,
       agent: value.selection.agent,
       model: selectionModel(value.selection),
-      genui: value.genui,
     },
     prepare: staged ? undefined : () => (committed ??= commit()),
   }
