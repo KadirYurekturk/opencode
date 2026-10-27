@@ -104,6 +104,10 @@ export namespace FSUtil {
         const resolved = path.resolve(windowsPath(input))
         // Sandboxes deny reads outside granted paths; canonicalize what we can see.
         return yield* fs.realPath(resolved).pipe(
+          // Windows' native realpath also normalizes letter case; keep the caller's spelling.
+          Effect.map((real) =>
+            process.platform === "win32" && real.toLowerCase() === resolved.toLowerCase() ? resolved : real,
+          ),
           Effect.catchIf(
             (error) => error.reason._tag === "NotFound" || isAccessDenied(error),
             () => Effect.succeed(resolved),
